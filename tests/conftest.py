@@ -56,11 +56,11 @@ with open(JSON_FILE, "w") as f:
     json.dump(TEST_DATA, f)
 with open(YAML_FILE, "w") as f:
     yaml.safe_dump(TEST_DATA, f, sort_keys=False)
-with open(TSV_FILE, "w") as f:
+with open(TSV_FILE, "w", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=TEST_DATA[0].keys(), delimiter="\t")
     writer.writeheader()
     writer.writerows(TEST_DATA)
-with open(CSV_FILE, "w") as f:
+with open(CSV_FILE, "w", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=TEST_DATA[0].keys())
     writer.writeheader()
     writer.writerows(TEST_DATA)
