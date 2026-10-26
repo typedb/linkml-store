@@ -1,13 +1,4 @@
-"""Tests for the TypeDB adapter.
-
-The planner tests need no server: they check the TypeQL that would be sent. The
-agreement test is the important one, because the adapter and ``gen-typedb`` must
-choose identical labels or inserts fail against a generated schema. The integration
-tests need a TypeDB 3.12+ server, for example::
-
-    typedb server --config ./typedb-config.yml
-
-"""
+"""Tests for the TypeDB adapter. Tests marked ``typedb`` need a TypeDB 3.12+ server."""
 
 from pathlib import Path
 
@@ -65,8 +56,7 @@ def test_handle_registered():
         ("typedb://u:p@example.org:1730/db", "example.org:1730", "u", "p", "db", True, None),
         ("typedb://localhost/db", "localhost:1729", "admin", "password", "db", False, None),
         ("localhost:1729/db", "localhost:1729", "admin", "password", "db", False, None),
-        # the documented Studio / TypeDB Cloud form: the address carries its own scheme,
-        # "?name=" is a connection display name, and the database is the path
+        # Studio / Cloud form: the address has its own scheme; "?name=" is a display name
         (
             "typedb://admin:pw@https://x.cluster.typedb.com:80/?name=engineers-dev",
             "x.cluster.typedb.com:80",
@@ -142,7 +132,7 @@ def test_multi_node_address_rejected():
         (False, "boolean", "false"),
         ("true", "boolean", "true"),
         ("2024-01-02T03:04:05", "datetime", "2024-01-02T03:04:05"),
-        # TypeDB 'datetime' rejects an offset, so offsets are converted away
+        # 'datetime' drops the offset
         ("2024-01-02T03:04:05+00:00", "datetime", "2024-01-02T03:04:05"),
         ("2024-01-02T03:04:05Z", "datetime", "2024-01-02T03:04:05"),
         ("2024-01-02T03:04:05+05:30", "datetime", "2024-01-01T21:34:05"),
@@ -230,11 +220,7 @@ def test_inlined_object_becomes_its_own_entity(schema_view):
 
 
 def test_narrowed_slot_uses_sub_relation(schema_view):
-    """``Study.part_of`` narrows ``NamedThing`` to ``Study``, so the sub-relation is used.
-
-    The played role is named after the slot's own range, not the narrowed one, which is
-    why this is ``Study_NamedThing`` rather than ``Study_Study``.
-    """
+    """``Study.part_of`` narrows ``NamedThing`` to ``Study``, so the sub-relation is used."""
     typeql = plan_inserts(schema_view, "Study", [STUDY])[0].to_typeql()
     assert "isa part_of_Study;" in typeql
     assert "Study_NamedThing: " in typeql
@@ -327,11 +313,7 @@ def test_unknown_dangling_policy_rejected(schema_view):
 
 @pytest.fixture
 def offline_collection(schema_view):
-    """A collection bound to the mini schema, with no server connection.
-
-    The driver is only created on first use, so the query-building helpers can be
-    exercised without a TypeDB server.
-    """
+    """A collection bound to the mini schema, with no server connection."""
     from linkml_store.api.stores.typedb.typedb_database import TypeDBDatabase
 
     db = TypeDBDatabase(handle="typedb://localhost:1729/test")
@@ -368,13 +350,12 @@ def test_match_block_in_operator(offline_collection):
 @pytest.mark.parametrize(
     "constraint,expected",
     [
-        ({"$ne": "x"}, '$v_name != "x";'),
         ({"$gt": "a"}, '$v_name > "a";'),
         ({"$gte": "a"}, '$v_name >= "a";'),
         ({"$lt": "z"}, '$v_name < "z";'),
         ({"$lte": "z"}, '$v_name <= "z";'),
         ({"$contains": "x"}, '$v_name == "x";'),
-        ({"$like": "^a.*"}, '$v_name like "^a.*";'),
+        ({"$like": "a%"}, '$v_name like "^a.*$";'),
     ],
 )
 def test_match_block_operators(offline_collection, constraint, expected):
@@ -382,6 +363,13 @@ def test_match_block_operators(offline_collection, constraint, expected):
     block = offline_collection._match_block({"name": constraint})
     assert "$x has name $v_name;" in block
     assert expected in block
+
+
+def test_match_block_ne_matches_missing(offline_collection):
+    """`$ne` is a negation, so objects lacking the slot still match, as in duckdb."""
+    block = offline_collection._match_block({"name": {"$ne": "x"}})
+    assert 'not { $x has name == "x"; };' in block
+    assert "$v_name" not in block
 
 
 def test_match_block_combines_operators(offline_collection):
@@ -437,11 +425,7 @@ def test_update_queries_single_valued(offline_collection):
 
 
 def test_update_queries_multivalued_replaces_set(offline_collection):
-    """A multivalued scalar is replaced wholesale: delete the old, insert the new.
-
-    Also checks the reserved-word rename survives the update path: ``alias`` is a
-    TypeQL keyword, so the attribute is ``alias_attr``.
-    """
+    """A multivalued scalar is replaced wholesale: delete the old, insert the new."""
     queries = offline_collection._update_queries({"id": "mini:a", "alias": ["x", "y"]}, {"id": "mini:a"}, None)
     joined = "\n---\n".join(queries)
     assert "delete $old of $x;" in joined, joined
@@ -474,13 +458,7 @@ def test_upsert_requires_a_filter_field(offline_collection):
 
 
 def test_vendored_naming_matches_upstream():
-    """The vendored naming rules must be byte-identical to linkml's copy.
-
-    This is the drift guard for the vendored file. It can only run where linkml is
-    installed, so it skips on a minimal install -- which means a stale copy is caught
-    by CI's full-extras job and by ``just check-typedb-naming``, not by a developer's
-    minimal environment. If this fails, run ``just sync-typedb-naming``.
-    """
+    """The vendored naming rules must be byte-identical to linkml's copy."""
     upstream = pytest.importorskip(
         "linkml.generators.typedb.naming",
         reason="requires linkml, which owns the upstream naming rules",
@@ -498,12 +476,7 @@ def test_vendored_naming_matches_upstream():
 
 
 def test_labels_agree_with_generated_schema(schema_view):
-    """Every label the planner emits must be defined by ``gen-typedb``.
-
-    This is the drift guard. The adapter and the generator read the same naming
-    module, so this should hold by construction; the test exists to catch a change
-    to one side that forgets the other.
-    """
+    """Every label the planner emits must be defined by ``gen-typedb``."""
     linkml_generators = pytest.importorskip("linkml.generators.typedbgen", reason="requires the typedb extra (linkml)")
     schema = linkml_generators.TypeDBGenerator(str(SCHEMA)).serialize()
 
@@ -600,11 +573,7 @@ def test_no_batch_open_by_default(offline_collection):
 
 @pytest.mark.typedb
 def test_batch_write_spans_collections(typedb_db):
-    """A cyclic two-phase load works when one transaction spans every collection.
-
-    Each pass on its own would fail: the entities pass commits a Study whose required
-    ``part_of`` link does not exist yet.
-    """
+    """A cyclic two-phase load works when one transaction spans every collection."""
     from linkml_store.api.stores.typedb.typeql_insert import MODE_ENTITIES, MODE_REFERENCES
 
     studies = [

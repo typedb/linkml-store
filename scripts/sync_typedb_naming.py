@@ -1,22 +1,7 @@
 #!/usr/bin/env python
-"""Sync the vendored copy of linkml's TypeDB naming rules.
+"""Sync the TypeDB adapter's vendored copy of ``linkml.generators.typedb.naming``.
 
-The TypeDB adapter has to choose exactly the labels that ``gen-typedb`` wrote into the
-schema it loads into. Those rules live in ``linkml.generators.typedb.naming``, which is
-not yet in any linkml release, so a verbatim copy is vendored into the adapter and this
-script keeps it current.
-
-Usage::
-
-    python scripts/sync_typedb_naming.py           # update the vendored copy
-    python scripts/sync_typedb_naming.py --check   # fail if it is stale
-
-``--check`` is what CI and the equality test use. Both require ``linkml`` to be
-importable; without it there is nothing to compare against and the script says so
-rather than pretending the copy is current.
-
-Once a linkml release carries the module, delete the vendored file and this script and
-import ``linkml.generators.typedb.naming`` directly.
+Pass ``--check`` to fail if the copy is stale. Delete this script once a linkml release ships the module.
 """
 
 import argparse
@@ -30,32 +15,15 @@ MARKER = "# >>> BEGIN VENDORED CONTENT >>>"
 HEADER = f"""# ---------------------------------------------------------------------------
 # VENDORED FILE - DO NOT EDIT BY HAND
 #
-# Verbatim copy of linkml.generators.typedb.naming.
-#
-# The adapter must choose exactly the labels gen-typedb wrote into the schema it
-# loads into, so these rules cannot be reimplemented here. They are vendored rather
-# than imported because the module is not in any linkml release yet, and uv sources
-# do not survive into published wheel metadata.
-#
-# To update:   just sync-typedb-naming
-# To verify:   python scripts/sync_typedb_naming.py --check
-#
-# Everything below the marker is byte-identical to upstream, enforced by
-# tests/test_api/test_typedb_adapter.py::test_vendored_naming_matches_upstream
-# whenever linkml is installed.
-#
-# When a linkml release includes the module, delete this file and import
-# linkml.generators.typedb.naming directly.
+# Verbatim copy of linkml.generators.typedb.naming, which no linkml release ships yet.
+# Update with `just sync-typedb-naming`; delete once a release includes the module.
 # ---------------------------------------------------------------------------
 {MARKER}
 """
 
 
 def upstream_source() -> str:
-    """Return the source text of linkml's naming module.
-
-    :raises SystemExit: if linkml is not importable
-    """
+    """Return the source text of linkml's naming module."""
     try:
         from linkml.generators.typedb import naming
     except ImportError:

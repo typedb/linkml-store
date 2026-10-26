@@ -1,44 +1,17 @@
-"""Turn LinkML instance data into TypeQL insert queries.
+"""Turn LinkML instance data into TypeQL insert queries, one ``match``/``insert`` per object.
 
-This module needs only a :class:`SchemaView` and the shared naming rules, so it can be
-exercised without a TypeDB server and reused by anything else that has to write TypeQL
-(a ``linkml-convert`` dumper, for instance).
-
-The labels chosen here must match the ones ``gen-typedb`` wrote into the schema, so
-every label comes from :mod:`linkml_store.api.stores.typedb.naming` rather than being
-recomputed locally. That module is a vendored verbatim copy of
-``linkml.generators.typedb.naming``, kept current by ``scripts/sync_typedb_naming.py``;
-vendoring keeps ``linkml`` off the adapter's runtime path, in line with the other
-backends owning their own mappings (see ``duckdb/mappings.py``).
-
-Shape of the output
--------------------
-One query per top-level object, in two parts:
-
-- a ``match`` clause binding each object referenced by identifier, and
-- an ``insert`` clause creating the entity, any inlined objects, and the relations
-  linking them.
-
-Inlined objects without an identifier are created in the same ``insert`` clause and
-linked by variable, so they need no key of their own.
-
-Cardinality and transactions
-----------------------------
-TypeDB checks ``@card`` lower bounds at commit, not at insert. A mandatory relation
-is therefore only satisfiable if the entity and its relations land in the same
-transaction, and references to other top-level objects are only matchable once those
-objects exist. :func:`plan_inserts` returns the queries in dependency order -- all
-entities before any cross-object reference -- on the assumption that the caller runs
-the whole batch in a single transaction and commits once.
+Needs no server. Labels come from the vendored ``naming`` module so they match ``gen-typedb``.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Optional
+from decimal import Decimal
+from typing import Any, Optional
 
 from linkml_runtime.utils.schemaview import SchemaView
 
@@ -56,34 +29,25 @@ from linkml_store.api.stores.typedb.naming import (
 
 logger = logging.getLogger(__name__)
 
-#: What to do when an object references an identifier that is not being inserted
-#: and does not already exist in the database.
+#: How to handle a reference to an identifier that neither the batch nor the database holds.
 DANGLING_ERROR = "error"
 DANGLING_SKIP = "skip"
 DANGLING_STUB = "stub"
 
 _DANGLING_POLICIES = (DANGLING_ERROR, DANGLING_SKIP, DANGLING_STUB)
 
-#: What a plan emits. Cyclic data cannot be loaded in one pass, because a relation can
-#: only link instances that already exist: NMDC's provenance graph has
-#: DataObject.was_generated_by pointing at MassSpectrometry while
-#: MassSpectrometry.has_output points back at DataObject. Such a dataset is loaded in
-#: two passes, ``MODE_ENTITIES`` then ``MODE_REFERENCES``.
+#: What a plan emits; cyclic data loads in two passes, ``MODE_ENTITIES`` then ``MODE_REFERENCES``.
 MODE_FULL = "full"
 MODE_ENTITIES = "entities"
 MODE_REFERENCES = "references"
 _MODES = (MODE_FULL, MODE_ENTITIES, MODE_REFERENCES)
 
+_BARE_LITERAL = re.compile(r"[\w:+\-./ ]+")
+
 
 @dataclass(frozen=True)
 class DanglingReference:
-    """One reference that could not be resolved.
-
-    :ivar slot: the LinkML slot carrying the reference
-    :ivar identifier: the identifier that resolved to nothing
-    :ivar target_class: the slot's range, i.e. what was being referenced
-    :ivar source_id: the identifier of the object holding the reference, if it has one
-    """
+    """A reference that resolves to nothing."""
 
     slot: str
     identifier: str
@@ -92,14 +56,7 @@ class DanglingReference:
 
 
 class DanglingReferenceError(ValueError):
-    """Raised when references cannot be resolved and the policy is ``error``.
-
-    Carries *every* unresolvable reference found while planning, not just the first.
-    Planning is pure, so nothing has been written when this is raised: a caller can
-    report the whole set, fix the data once, and retry.
-
-    :ivar violations: every unresolvable reference, in the order encountered
-    """
+    """Lists every dangling reference under the ``error`` policy; planning has written nothing."""
 
     def __init__(self, message: str, violations: list[DanglingReference]):
         super().__init__(message)
@@ -107,24 +64,12 @@ class DanglingReferenceError(ValueError):
 
 
 class StubNotPossibleError(ValueError):
-    """Raised when the ``stub`` policy cannot produce a valid placeholder.
-
-    A stub carries only the identifier, so a class with mandatory attributes cannot be
-    stubbed: TypeDB checks ``@card`` lower bounds at commit and rejects it with
-    ``[CNT5]``.
-    """
+    """The ``stub`` policy can't stub a class with required slots."""
 
 
 @dataclass
 class InsertQuery:
-    """A single TypeQL insert query, kept as clauses so it can be inspected in tests.
-
-    :ivar match: ``match`` clause lines, each already terminated with ``;``
-    :ivar insert: ``insert`` clause lines, each already terminated with ``;``
-    :ivar source_class: the LinkML class of the top-level object this query inserts
-    :ivar skipped_references: ``(slot_name, identifier)`` pairs dropped under the
-        ``skip`` dangling-reference policy
-    """
+    """A TypeQL insert query, held as clause lines."""
 
     source_class: str
     match: list[str] = field(default_factory=list)
@@ -136,11 +81,7 @@ class InsertQuery:
     keyed_vars: dict[tuple[str, str], str] = field(default_factory=dict, repr=False)
 
     def to_typeql(self) -> str:
-        """Render the query as a TypeQL string.
-
-        :return: a ``match ... insert ...`` query, or a bare ``insert`` if nothing
-            needs matching
-        """
+        """Render the query as TypeQL."""
         parts = []
         if self.match:
             parts.append("match\n" + "\n".join(f"  {line}" for line in self.match))
@@ -154,16 +95,7 @@ def typeql_literal(
     losses: Optional[list] = None,
     label: Optional[str] = None,
 ) -> str:
-    """Render ``value`` as a TypeQL literal of ``value_type``.
-
-    TypeDB 3 writes temporal and numeric literals bare; only strings are quoted.
-
-    :param value: the Python value taken from the instance data
-    :param value_type: the TypeDB value type, as resolved by the naming module
-    :param losses: if given, a list to append a record to whenever a non-zero UTC
-        offset has to be discarded; the caller reports these once per load
-    :param label: the attribute label, used only in those records
-    :return: the literal text to embed in a query
+    """Render ``value`` as a TypeQL literal of ``value_type``, recording dropped UTC offsets in ``losses``.
 
     >>> typeql_literal("ab\\"c", "string")
     '"ab\\\\"c"'
@@ -178,20 +110,29 @@ def typeql_literal(
         if isinstance(value, str):
             return "true" if value.lower() in ("true", "1", "yes") else "false"
         return "true" if value else "false"
-    if value_type in ("integer", "double"):
-        return str(value)
+    # Coerce numbers so a string can't inject TypeQL.
+    if value_type == "integer":
+        return str(int(value))
+    if value_type == "double":
+        return str(float(value))
     if value_type == "decimal":
-        # TypeDB distinguishes decimal literals from doubles by a `dec` suffix.
-        return f"{value}dec"
+        return f"{Decimal(str(value))}dec"
     if value_type == "datetime-tz":
-        return value.isoformat() if isinstance(value, datetime) else str(value)
+        return _bare(value.isoformat() if isinstance(value, datetime) else str(value))
     if value_type == "datetime":
-        return _naive_datetime(value, losses, label)
+        return _bare(_naive_datetime(value, losses, label))
     if value_type in ("date", "duration"):
         if isinstance(value, (datetime, date)):
             return value.isoformat()
-        return str(value)
+        return _bare(str(value))
     return typeql_string(str(value))
+
+
+def _bare(text: str) -> str:
+    """Return ``text`` as an unquoted literal, rejecting anything that could inject TypeQL."""
+    if not _BARE_LITERAL.fullmatch(text):
+        raise ValueError(f"Not a valid TypeQL temporal literal: {text!r}")
+    return text
 
 
 def _local_name(identifier: str) -> str:
@@ -208,27 +149,7 @@ def _local_name(identifier: str) -> str:
 
 
 def _naive_datetime(value: Any, losses: Optional[list] = None, label: Optional[str] = None) -> str:
-    """Render ``value`` for a TypeDB ``datetime`` attribute, which rejects offsets.
-
-    TypeDB distinguishes ``datetime`` from ``datetime-tz`` and refuses an offset-bearing
-    literal for the former ([DVL15]). The TypeQL generator maps LinkML ``datetime`` to
-    ``datetime``, matching what ``sqltablegen`` does for SQL (SQLAlchemy ``DateTime()``
-    is ``TIMESTAMP WITHOUT TIME ZONE``), so an offset-aware value is converted to UTC and
-    the offset dropped. The instant is always preserved; only the local offset is lost.
-
-    A ``+00:00`` offset carries no information beyond the instant, so discarding it is
-    lossless and silent. A non-zero offset is a real loss, so it is recorded in
-    ``losses`` for the caller to report once per load rather than once per value.
-
-    Note that the reverse mapping is deliberately not used: ``xsd:dateTime`` leaves the
-    timezone *optional*, and an absent one means unknown rather than UTC, so stamping a
-    naive value with ``+00:00`` would assert an instant the data never gave.
-
-    :param value: a ``datetime``, or a string that may carry an offset
-    :param losses: list to append ``(label, original, offset)`` to on a real loss
-    :param label: the attribute label, for the loss record
-    :return: an offset-free ISO 8601 literal
-    """
+    """Convert ``value`` to naive UTC, since TypeDB ``datetime`` rejects offsets ([DVL15])."""
     parsed = value
     if not isinstance(parsed, datetime):
         text = str(parsed)
@@ -256,12 +177,7 @@ def _format_offset(offset: timedelta) -> str:
 
 
 class TypeQLInserter:
-    """Plans TypeQL inserts for instance data conforming to a LinkML schema.
-
-    :param schema_view: the schema the data conforms to, and the same one the
-        TypeDB schema was generated from
-    :param on_dangling_reference: one of ``error``, ``skip`` or ``stub``
-    """
+    """Plans TypeQL inserts for instance data conforming to a LinkML schema."""
 
     def __init__(
         self,
@@ -290,17 +206,13 @@ class TypeQLInserter:
         narrowings = build_class_range_narrowings(schema_view, relationship_classes, self.rel_names, self.role_names)
         self._narrowings = {(n.narrowing_class, n.slot_name): n for n in narrowings}
         self._class_by_uri = self._build_class_uri_index()
-        #: identifiers that already exist in the database, before this batch
+        #: identifiers in the database before this batch
         self.existing_ids: set[str] = set()
-        #: class -> identifiers, when the caller knows which class each id belongs to.
-        #: An id-only check passes for an id stored under a *different* class, and the
-        #: generated `match $m isa <expected>, has id ...` then finds nothing, so the
-        #: insert silently writes nothing. Checking per class catches that.
+        #: class -> identifiers, to catch ids stored under the wrong class
         self.known_by_class: Optional[dict] = None
-        #: identifiers this batch has inserted, so repeats can be matched instead
+        #: identifiers this batch has inserted
         self.created_ids: set[str] = set()
-        #: ``(label, original, offset)`` for every non-zero UTC offset discarded, so the
-        #: caller can report them once per load instead of once per value
+        #: ``(label, original, offset)`` for each discarded non-zero UTC offset
         self.offset_losses: list[tuple[Optional[str], str, str]] = []
         #: ``(slot, identifier)`` for every reference dropped under the ``skip`` policy
         self.skipped_references: list[tuple[str, str]] = []
@@ -310,23 +222,14 @@ class TypeQLInserter:
         self.violations: list[DanglingReference] = []
 
     def _build_class_uri_index(self) -> dict[str, str]:
-        """Index classes by every spelling instance data might use in a ``type`` field.
-
-        NMDC data, for example, sets ``type: prov:Association`` where the class is
-        ``CreditAssociation``, so the CURIE and URI forms both have to resolve.
-
-        :return: identifier spelling → LinkML class name
-        """
+        """Index classes by every spelling a ``type`` field might use (name, CURIE, URI)."""
         index: dict[str, str] = {}
-        # Sorted so that ties between two classes claiming the same spelling resolve
-        # the same way on every run.
+        # Sorted for deterministic ties.
         for class_name in sorted(self._all_classes):
             class_def = self.sv.get_class(class_name)
             index[class_name] = class_name
             index.setdefault(typedb_name(class_name), class_name)
-            # Biolink leaves class_uri unset and relies on LinkML deriving it from the
-            # default prefix and the CamelCase name, so the derived URI has to be indexed
-            # too: KGX rows identify their class as `biolink:Case`.
+            # Index derived URIs too (Biolink leaves class_uri unset).
             try:
                 derived = self.sv.get_uri(class_name)
             except Exception:  # pragma: no cover - defensive, some elements have no URI
@@ -343,11 +246,7 @@ class TypeQLInserter:
         return index
 
     def _expand(self, curie: str) -> Optional[str]:
-        """Expand a CURIE to a full URI using the schema's prefix map.
-
-        :param curie: a CURIE such as ``prov:Association``
-        :return: the expanded URI, or ``None`` if the prefix is unknown
-        """
+        """Expand a CURIE using the schema's prefixes, or return None."""
         if ":" not in curie or curie.startswith("http"):
             return None
         prefix, local = curie.split(":", 1)
@@ -357,12 +256,7 @@ class TypeQLInserter:
         return f"{namespaces[prefix]}{local}"
 
     def resolve_class(self, declared: Any, fallback: str) -> str:
-        """Resolve a ``type``-field value to a LinkML class name.
-
-        :param declared: the value of the object's ``type`` field, if any
-        :param fallback: the class to use when ``declared`` is absent or unknown
-        :return: a LinkML class name
-        """
+        """Resolve a ``type``-field value to a LinkML class name, else ``fallback``."""
         if not declared or not isinstance(declared, str):
             return fallback
         resolved = self._class_by_uri.get(declared)
@@ -371,34 +265,26 @@ class TypeQLInserter:
         return self._class_by_uri.get(_local_name(declared), fallback)
 
     def identifier_slot(self, class_name: str) -> Optional[str]:
-        """Return the name of ``class_name``'s identifier slot, if it has one.
-
-        :param class_name: a LinkML class name
-        :return: the slot name, or ``None`` for a class with no identifier
-        """
+        """Return ``class_name``'s identifier slot, if it has one."""
         for slot in self.sv.class_induced_slots(class_name):
             if slot.identifier or slot.key:
                 return slot.name
         return None
 
     def required_slots(self, class_name: str) -> list[str]:
-        """Return the names of slots ``class_name`` must carry, excluding its identifier.
-
-        :param class_name: a LinkML class name
-        :return: required slot names, which a bare stub could not satisfy
-        """
+        """Return ``class_name``'s required slots, excluding its identifier."""
         id_slot = self.identifier_slot(class_name)
         return [slot.name for slot in self.sv.class_induced_slots(class_name) if slot.required and slot.name != id_slot]
 
     def _relation_for(self, owner_class: str, slot_name: str, target_class: str) -> tuple[str, str, str]:
-        """Resolve the relation and role labels linking ``owner_class`` to ``target_class``.
-
-        :return: ``(relation_label, owning_role, played_role)``
-        """
-        # a narrowing is registered on the class that introduces it; subclasses inherit it
+        """Return ``(relation, owning_role, played_role)`` linking ``owner_class`` to ``target_class``."""
+        # Subclasses inherit narrowings from the class that introduces them.
         narrowing = next(
-            (n for anc in self.sv.class_ancestors(owner_class)
-             if (n := self._narrowings.get((anc, slot_name))) is not None),
+            (
+                n
+                for anc in self.sv.class_ancestors(owner_class)
+                if (n := self._narrowings.get((anc, slot_name))) is not None
+            ),
             None,
         )
         owning_role, played_role = self.role_names.get(slot_name, (typedb_name(slot_name), typedb_name(target_class)))
@@ -413,21 +299,11 @@ class TypeQLInserter:
         counter: "_Counter",
         known_ids: Optional[set[str]] = None,
     ) -> InsertQuery:
-        """Plan the insert for one top-level object and everything inlined in it.
-
-        :param obj: the instance data
-        :param class_name: the collection's target class, used when the object
-            declares no resolvable ``type``
-        :param counter: source of unique variable suffixes
-        :param known_ids: identifiers that exist or are being inserted; ``None``
-            disables dangling-reference checking
-        :return: the planned query
-        """
+        """Plan the insert for one top-level object and everything inlined in it."""
         resolved = self.resolve_class(obj.get("type"), class_name)
         query = InsertQuery(source_class=resolved)
         if resolved in self.relationship_classes:
-            # Relations can only link existing players, so they are never emitted in the
-            # entities pass; the references pass creates them whole.
+            # Relations link existing players, so only the references pass creates them.
             if self.mode != MODE_ENTITIES:
                 self._emit_relation_instance(obj, resolved, query, counter, known_ids)
             return query
@@ -442,28 +318,22 @@ class TypeQLInserter:
         counter: "_Counter",
         known_ids: Optional[set[str]],
         is_root: bool = False,
-    ) -> str:
-        """Emit the insert clauses for ``obj`` and return the variable bound to it.
+    ) -> Optional[str]:
+        """Emit the insert clauses for ``obj`` and return its variable.
 
-        A nested object carrying an identifier is created at most once: repeats within
-        the query reuse its variable, and repeats later in the batch are matched. Many
-        objects share inlined keyed objects -- NMDC biosamples all inline the same
-        ``OntologyClass`` environmental terms -- and a second insert would violate the
-        ``@key`` on ``id`` with ``[CNT9]``.
-
-        :param is_root: True for the top-level object of a query, which is always
-            inserted; only nested objects are deduplicated this way.
+        The planner creates each keyed nested object once and matches repeats, to avoid ``[CNT9]``.
         """
         id_slot = self.identifier_slot(class_name)
 
         if self.mode == MODE_REFERENCES and is_root:
-            # The entity already exists from the entities pass, so bind it instead.
+            # The entities pass created it; bind it.
             if not id_slot or obj.get(id_slot) is None:
                 return None
             var = f"$x{next(counter)}"
             id_label = self.attr_names.get(id_slot, typedb_name(id_slot))
             query.match.append(
-                f"{var} isa {typedb_name(class_name)}, has {id_label} {self._id_literal(class_name, id_slot, obj[id_slot])};"
+                f"{var} isa {typedb_name(class_name)}, "
+                f"has {id_label} {self._id_literal(class_name, id_slot, obj[id_slot])};"
             )
             for slot in self.sv.class_induced_slots(class_name):
                 if (
@@ -485,9 +355,11 @@ class TypeQLInserter:
                 return query.keyed_vars[key]
             if identifier in self.existing_ids or identifier in self.created_ids:
                 var = f"$k{next(counter)}"
-                id_slot = self.identifier_slot(class_name)
                 id_label = self.attr_names.get(id_slot, typedb_name(id_slot))
-                query.match.append(f"{var} isa {typedb_name(class_name)}, has {id_label} {typeql_string(identifier)};")
+                query.match.append(
+                    f"{var} isa {typedb_name(class_name)}, "
+                    f"has {id_label} {self._id_literal(class_name, id_slot, identifier)};"
+                )
                 query.keyed_vars[key] = var
                 return var
 
@@ -527,21 +399,7 @@ class TypeQLInserter:
         counter: "_Counter",
         known_ids: Optional[set[str]],
     ) -> Optional[str]:
-        """Emit an instance of a class the generator mapped to a TypeDB ``relation``.
-
-        A class with ``represents_relationship``, or mapped to ``rdf:Statement`` the way
-        Biolink's associations are, becomes a ``relation`` rather than an ``entity``. Its
-        class-ranged slots are its roles, so the instance is the link itself::
-
-            $r isa case_to_disease_association,
-                links (case_subject: $s, disease_object: $o),
-                has knowledge_level "assertion";
-
-        Role labels come from the shared naming module, which specialises them along
-        ``is_a`` exactly as the generator's ``relates ... as ...`` declarations do.
-
-        :return: the variable bound to the relation, or ``None`` if no role could be filled
-        """
+        """Emit an instance of a relationship class, or return None if it fills no role."""
         role_terms: list[str] = []
         for slot in self.sv.class_induced_slots(class_name):
             if slot.name not in obj or obj[slot.name] is None:
@@ -564,13 +422,12 @@ class TypeQLInserter:
                         query,
                         counter,
                         known_ids,
-                        _owner_id(obj, self),
+                        _owner_id(obj, class_name, self),
                     )
                 if var is not None:
                     role_terms.append(f"{info.role_name}: {var}")
 
         if not role_terms:
-            # A relation with no players cannot be inserted; the caller drops the query.
             return None
 
         attr_terms = []
@@ -608,7 +465,7 @@ class TypeQLInserter:
         items = value if isinstance(value, list) else [value]
 
         for item in items:
-            # entities pass: inlined children only. references pass: by-id links only.
+            # The entities pass emits inlined children; the references pass emits by-id links.
             if self.mode == MODE_ENTITIES and not isinstance(item, dict):
                 continue
             if self.mode == MODE_REFERENCES and isinstance(item, dict):
@@ -618,7 +475,7 @@ class TypeQLInserter:
                 target_var = self._emit_entity(item, item_class, query, counter, known_ids)
             else:
                 target_var = self._emit_reference(
-                    str(item), slot_name, target_class, query, counter, known_ids, _owner_id(owner, self)
+                    str(item), slot_name, target_class, query, counter, known_ids, _owner_id(owner, owner_class, self)
                 )
                 if target_var is None:
                     continue
@@ -628,22 +485,14 @@ class TypeQLInserter:
             query.insert.append(f"({owning_role}: {owner_var}, {played_role}: {target_var}) isa {relation};")
 
     def _reference_exists(self, identifier: str, target_class: str, known_ids) -> bool:
-        """Return True if ``identifier`` exists as ``target_class`` or a subtype of it.
-
-        With a class-aware view, an id stored under an unrelated class counts as missing,
-        because the emitted ``match`` names the expected class and would find nothing.
-        """
+        """Return True if ``identifier`` exists as ``target_class`` or a subtype of it."""
         if self.known_by_class is not None:
             allowed = {target_class} | set(self.sv.class_descendants(target_class))
             return any(identifier in self.known_by_class.get(cls, ()) for cls in allowed)
         return known_ids is None or identifier in known_ids
 
     def _id_literal(self, class_name: str, id_slot: str, value) -> str:
-        """Format an identifier for a query literal using its declared value type.
-
-        Identifiers are not always strings -- Reactome keys on an integer ``dbId`` -- so
-        quoting unconditionally produces a match that silently finds nothing.
-        """
+        """Format an identifier using its declared value type (some ids are integers)."""
         slot = self.sv.induced_slot(id_slot, class_name)
         value_type = resolve_typedb_value_type(self.sv, slot.range) or "string"
         return typeql_literal(value, value_type)
@@ -658,15 +507,10 @@ class TypeQLInserter:
         known_ids: Optional[set[str]],
         source_id: Optional[str] = None,
     ) -> Optional[str]:
-        """Bind an existing object by identifier, honouring the dangling-reference policy.
-
-        :param source_id: identifier of the object holding the reference, for diagnostics
-        :return: the variable bound to the target, or ``None`` if the reference was skipped
-        """
+        """Bind an existing object by identifier, applying the dangling-reference policy."""
         if known_ids is not None and not self._reference_exists(identifier, target_class, known_ids):
             if self.on_dangling_reference == DANGLING_ERROR:
-                # Record and carry on: planning is pure, so collecting every violation
-                # costs nothing and lets plan_inserts raise once with the full picture.
+                # Collect every violation; plan_inserts raises once with them all.
                 self.violations.append(
                     DanglingReference(
                         slot=slot_name,
@@ -677,16 +521,14 @@ class TypeQLInserter:
                 )
                 return None
             if self.on_dangling_reference == DANGLING_SKIP:
-                # Debug, not warning: a load can skip thousands, and one aggregate
-                # summary per load is emitted by :func:`plan_inserts` instead.
+                # Debug only; plan_inserts logs one summary per load.
                 logger.debug("Skipping dangling reference %s -> %s", slot_name, identifier)
                 query.skipped_references.append((slot_name, identifier))
                 self.skipped_references.append((slot_name, identifier))
                 return None
             var = self._emit_stub(identifier, target_class, query, counter)
             self.stubbed_references.append((slot_name, identifier))
-            # The stub now exists, so later queries in the batch must match it rather
-            # than create a second one: `id` is a @key, and a duplicate trips [CNT9].
+            # Later queries must match the stub, not recreate it ([CNT9] on the @key).
             known_ids.add(identifier)
             return var
 
@@ -705,9 +547,9 @@ class TypeQLInserter:
         return var
 
     def _emit_stub(self, identifier: str, target_class: str, query: InsertQuery, counter: "_Counter") -> str:
-        """Create a minimal entity carrying only the identifier, for the ``stub`` policy."""
+        """Create a placeholder entity holding only the identifier."""
         if identifier in query.stub_vars:
-            return query.stub_vars[identifier]  # already stubbed in this very query
+            return query.stub_vars[identifier]
         id_slot = self.identifier_slot(target_class)
         if id_slot is None:
             raise ValueError(f"Cannot stub {target_class!r}: it has no identifier slot.")
@@ -722,16 +564,18 @@ class TypeQLInserter:
         var = f"$s{next(counter)}"
         query.stub_vars[identifier] = var
         id_label = self.attr_names.get(id_slot, typedb_name(id_slot))
-        query.insert.append(f"{var} isa {typedb_name(target_class)}, has {id_label} {typeql_string(identifier)};")
+        query.insert.append(
+            f"{var} isa {typedb_name(target_class)}, "
+            f"has {id_label} {self._id_literal(target_class, id_slot, identifier)};"
+        )
         return var
 
 
-def _owner_id(obj: dict, inserter: "TypeQLInserter") -> Optional[str]:
-    """Return ``obj``'s own identifier if it has one, for diagnostics only."""
-    for key in ("id", "identifier"):
-        if obj.get(key) is not None:
-            return str(obj[key])
-    return None
+def _owner_id(obj: dict, class_name: str, inserter: "TypeQLInserter") -> Optional[str]:
+    """Return ``obj``'s identifier, for error messages."""
+    id_slot = inserter.identifier_slot(class_name)
+    value = obj.get(id_slot) if id_slot else None
+    return None if value is None else str(value)
 
 
 def plan_inserts(
@@ -740,25 +584,12 @@ def plan_inserts(
     objs: list[dict],
     on_dangling_reference: str = DANGLING_ERROR,
     known_ids: Optional[set[str]] = None,
-    id_resolver: Optional[Callable[[str], bool]] = None,
     mode: str = MODE_FULL,
 ) -> list[InsertQuery]:
     """Plan the insert queries for a batch of objects of one class.
 
-    :param schema_view: the schema the data conforms to
-    :param class_name: the batch's target class
-    :param objs: the instance data
-    :param on_dangling_reference: one of ``error``, ``skip`` or ``stub``
-    :param known_ids: identifiers already in the database. A ``set`` checks ids only; a
-        ``Mapping`` of class to ids additionally checks that each reference resolves to
-        the *expected* class, which an id-only check cannot do. The identifiers of
-        ``objs`` are added, so references within the batch always resolve. ``None``
-        disables checking altogether.
-    :param id_resolver: unused placeholder for a database-backed existence check
-    :param mode: ``full`` (default), or ``entities`` then ``references`` to load
-        cyclic data in two passes
-    :return: one query per object, in insertion order; objects that need no query in
-        this mode are omitted
+    :param known_ids: existing identifiers, as a set or a class -> ids mapping; ``None`` skips the check
+    :param mode: ``full``, or ``entities`` then ``references`` for cyclic data
     """
     inserter = TypeQLInserter(schema_view, on_dangling_reference=on_dangling_reference, mode=mode)
     if isinstance(known_ids, Mapping):
@@ -775,12 +606,10 @@ def plan_inserts(
 
     counter = _Counter()
     queries = [inserter.plan_object(obj, class_name, counter, effective_ids) for obj in objs]
-    # In the references pass an object with no by-id links yields a match with nothing
-    # to insert, which is not a runnable query.
+    # Drop match-only queries (references pass, no by-id links).
     queries = [q for q in queries if q.insert]
 
     def _summarise(records: list[tuple[str, str]]) -> tuple[int, int, str, str]:
-        """Return ``(count, distinct, slot list, example id)`` for a warning."""
         slots = sorted({slot for slot, _ in records})
         ids = sorted({identifier for _, identifier in records})
         return len(records), len(ids), ", ".join(slots), ids[0]
@@ -847,7 +676,7 @@ def plan_inserts(
 
 
 class _Counter:
-    """A monotonically increasing variable-suffix source shared across one batch."""
+    """Variable-suffix counter shared across one batch."""
 
     def __init__(self) -> None:
         self._n = -1

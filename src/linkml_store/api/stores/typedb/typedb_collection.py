@@ -1,13 +1,10 @@
-"""Collection-level operations for the TypeDB adapter.
-
-Insert and read are implemented; ``delete`` and ``update`` are not yet. Reads are built
-on a single ``query()``, which the base :class:`~linkml_store.api.collection.Collection`
-turns into ``find``, ``get``, ``get_one`` and ``find_iter``.
-"""
+"""Collection-level operations for the TypeDB adapter."""
 
 from __future__ import annotations
 
 import logging
+import re
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from linkml_store.api import Collection
@@ -25,37 +22,44 @@ from linkml_store.api.stores.typedb.typeql_insert import (
 
 logger = logging.getLogger(__name__)
 
-#: MongoDB-style comparison operators, as the duckdb adapter spells them, mapped to
-#: their TypeQL comparators. ``$in`` is a disjunction and is handled separately, and
-#: ``$contains`` is plain equality here: a multivalued LinkML slot becomes repeated
-#: ``has`` in TypeDB, so matching one value already means "contains".
+#: Mongo-style operators to TypeQL; ``$in``, ``$contains``, ``$like`` and ``$ne`` are handled separately.
 COMPARATORS = {
     "$gt": ">",
     "$gte": ">=",
     "$lt": "<",
     "$lte": "<=",
-    "$ne": "!=",
 }
-SUPPORTED_OPERATORS = sorted([*COMPARATORS, "$in", "$contains", "$like"])
+SUPPORTED_OPERATORS = sorted([*COMPARATORS, "$in", "$contains", "$like", "$ne"])
+
+
+def like_to_regex(pattern: str) -> str:
+    r"""Translate a SQL ``LIKE`` pattern to an anchored regex for TypeQL's ``like``.
+
+    >>> like_to_regex("a%b_c.")
+    '^a.*b.c\\.$'
+    """
+    parts = [".*" if c == "%" else "." if c == "_" else re.escape(c) for c in pattern]
+    return "^" + "".join(parts) + "$"
 
 
 class TypeDBCollection(Collection):
     """Adapter for a single LinkML class stored in a TypeDB database."""
 
-    #: What to do about references to objects that are neither in the batch nor in the
-    #: database. ``error`` fails fast, which is the right default: a TypeQL insert whose
-    #: ``match`` clause finds nothing inserts *nothing*, so an unchecked dangling
-    #: reference silently drops the whole object.
+    #: Default "error": an unmatched reference makes TypeQL silently insert nothing.
     on_dangling_reference: str = DANGLING_ERROR
 
-    #: Whether to pre-fetch existing identifiers to validate references. One query per
-    #: referenced class, so it is proportional to database size, not batch size.
+    #: Pre-fetch existing ids to validate references (one query per referenced class).
     check_references: bool = True
 
     @property
     def inserter(self) -> TypeQLInserter:
-        """Return a planner bound to this database's schema."""
-        return TypeQLInserter(self.parent.schema_view, on_dangling_reference=self.on_dangling_reference)
+        """Return a planner bound to this database's schema, rebuilt only when that or the policy changes."""
+        sv = self.parent.schema_view
+        cached = self.__dict__.get("_inserter")
+        if cached is None or cached.sv is not sv or cached.on_dangling_reference != self.on_dangling_reference:
+            cached = TypeQLInserter(sv, on_dangling_reference=self.on_dangling_reference)
+            self.__dict__["_inserter"] = cached
+        return cached
 
     def _check_if_initialized(self) -> bool:
         """Return True if the target entity type holds at least one instance."""
@@ -66,10 +70,7 @@ class TypeDBCollection(Collection):
     def insert(self, objs: Union[OBJECT, List[OBJECT]], mode: str = MODE_FULL, **kwargs):
         """Insert objects into TypeDB.
 
-        The whole batch runs in one write transaction and commits once. This is
-        deliberate: TypeDB checks ``@card`` lower bounds at commit, so an entity and
-        its mandatory relations must land together, and references within the batch
-        are only matchable once their targets are inserted.
+        The batch runs in a single write transaction, then commits.
 
         :param objs: one object or a list of them
         :param mode: ``full`` by default. Cyclic datasets cannot be loaded in one pass,
@@ -78,8 +79,6 @@ class TypeDBCollection(Collection):
         :raises DanglingReferenceError: under the ``error`` policy, if a reference
             resolves to nothing
         """
-        from typedb.driver import TransactionType
-
         if not isinstance(objs, list):
             objs = [objs]
         objs = [self._as_dict(o) for o in objs]
@@ -103,17 +102,7 @@ class TypeDBCollection(Collection):
             mode=mode,
         )
 
-        batch = self.parent._active_tx
-        if batch is not None:
-            # Inside a batch_write: contribute to it and let the batch commit.
-            for query in queries:
-                batch.query(query.to_typeql()).resolve()
-        else:
-            with self.parent.driver.transaction(self.parent._db_name, TransactionType.WRITE) as tx:
-                for query in queries:
-                    tx.query(query.to_typeql()).resolve()
-                tx.commit()
-
+        self._run_writes([q.to_typeql() for q in queries])
         self._post_insert_hook(objs)
 
     def upsert(
@@ -125,15 +114,8 @@ class TypeDBCollection(Collection):
     ):
         """Insert objects that are absent and update those already present.
 
-        Without this, re-running a load duplicates everything, because :meth:`insert`
-        always creates new entities.
-
         Matching is by ``filter_fields``, defaulting to the class's identifier slot,
         which is the natural key in a generated TypeDB schema.
-
-        Scalar attributes are replaced: single-valued ones through TypeQL's ``update``
-        stage, multivalued ones by deleting the existing values and inserting the new
-        set, so the supplied list wins outright.
 
         :param objs: one object or a list of them
         :param filter_fields: slots identifying an existing object; defaults to the
@@ -142,44 +124,74 @@ class TypeDBCollection(Collection):
             present on the object
         :raises ValueError: if an object carries none of the filter fields
 
+        Updates and inserts commit together, inside any open :meth:`batch_write`.
+
         .. note::
            Relations are written only when an object is newly inserted. Updating an
            existing object's references would mean deleting and recreating relations,
            which is not implemented.
         """
-        from typedb.driver import TransactionType
-
         if not isinstance(objs, list):
             objs = [objs]
         objs = [self._as_dict(o) for o in objs]
         class_name = self.target_class_name
+        id_slot = self.inserter.identifier_slot(class_name)
 
         if not filter_fields:
-            id_slot = self.inserter.identifier_slot(class_name)
             if not id_slot:
                 raise ValueError(f"{class_name!r} has no identifier slot, so upsert needs explicit filter_fields.")
             filter_fields = [id_slot]
 
-        to_insert: List[dict] = []
-        updates: List[str] = []
+        all_criteria = []
         for obj in objs:
             criteria = {f: obj[f] for f in filter_fields if obj.get(f) is not None}
             if not criteria:
                 raise ValueError(f"Object is missing every filter field {filter_fields}; cannot upsert it.")
-            if self.find(criteria).num_rows == 0:
-                to_insert.append(obj)
-            else:
-                updates.extend(self._update_queries(obj, criteria, update_fields))
+            all_criteria.append(criteria)
 
-        if updates:
-            with self.parent.driver.transaction(self.parent._db_name, TransactionType.WRITE) as tx:
-                for query in updates:
-                    tx.query(query).resolve()
-                tx.commit()
-            logger.info("Updated %d existing object(s) in %s", len(objs) - len(to_insert), class_name)
+        ctx = nullcontext() if self.parent._active_tx is not None else self.parent.batch_write()
+        with ctx:
+            # Matching on the identifier alone needs one query, not one per object.
+            existing = self._existing_ids(class_name, id_slot) if filter_fields == [id_slot] else None
+            to_insert: List[dict] = []
+            updates: List[str] = []
+            for obj, criteria in zip(objs, all_criteria):
+                if existing is not None:
+                    present = str(criteria[id_slot]) in existing
+                else:
+                    present = self.find(criteria).num_rows > 0
+                if present:
+                    updates.extend(self._update_queries(obj, criteria, update_fields))
+                else:
+                    to_insert.append(obj)
 
-        if to_insert:
-            self.insert(to_insert)
+            self._run_writes(updates)
+            if updates:
+                logger.info("Updated %d existing object(s) in %s", len(objs) - len(to_insert), class_name)
+            if to_insert:
+                self.insert(to_insert)
+
+    def _existing_ids(self, class_name: str, id_slot: str) -> set:
+        """Return the identifiers of every stored instance of ``class_name``."""
+        id_label = self.inserter.attr_names.get(id_slot, typedb_name(id_slot))
+        rows = self._read(f"match $x isa {typedb_name(class_name)}, has {id_label} $i; select $i;")
+        return {str(row["i"]) for row in rows if row.get("i") is not None}
+
+    def _run_writes(self, queries: List[str]) -> None:
+        """Run write queries in the open batch, or else in one committed transaction."""
+        from typedb.driver import TransactionType
+
+        if not queries:
+            return
+        batch = self.parent._active_tx
+        if batch is not None:
+            for query in queries:
+                batch.query(query).resolve()
+            return
+        with self.parent.driver.transaction(self.parent._db_name, TransactionType.WRITE) as tx:
+            for query in queries:
+                tx.query(query).resolve()
+            tx.commit()
 
     def _update_queries(self, obj: dict, criteria: dict, update_fields: Optional[List[str]]) -> List[str]:
         """Build the TypeQL needed to bring one existing object in line with ``obj``."""
@@ -230,10 +242,6 @@ class TypeDBCollection(Collection):
     def _known_ids(self, class_name: str, objs: List[dict]) -> Dict[str, set]:
         """Collect identifiers already present in the database, grouped by class.
 
-        Grouping matters: an id stored under a different class than a reference expects
-        would pass an id-only check, and the emitted ``match`` would then find nothing,
-        so the insert would silently write nothing.
-
         :param class_name: the batch's target class
         :param objs: the batch, scanned to find which classes it references
         :return: class name to the identifiers of its instances
@@ -253,15 +261,13 @@ class TypeDBCollection(Collection):
                 continue
             class_def = sv.get_class(target)
             if class_def is not None and class_def.mixin:
-                # Mixins are never emitted as TypeDB types; their slots are copied onto
-                # the implementers, so there is no `ontology_class` label to query.
-                continue
+                continue  # mixins aren't emitted as TypeDB types
             label = typedb_name(target)
             id_label = inserter.attr_names.get(id_slot, typedb_name(id_slot))
             try:
                 rows = self._read(f"match $x isa {label}, has {id_label} $i; select $i;")
             except Exception as exc:
-                # A class the generator did not emit, e.g. an abstract type it dropped.
+                # [INF2]: no such type, e.g. an abstract class the generator dropped.
                 if "[INF2]" not in str(exc):
                     raise
                 logger.debug("No TypeDB type for %r; skipping it in the reference check", target)
@@ -279,8 +285,7 @@ class TypeDBCollection(Collection):
 
         batch = self.parent._active_tx
         if batch is not None:
-            # Read through the open batch, so a reference check sees what the batch has
-            # written but not yet committed. A separate read transaction would not.
+            # Read through the batch so uncommitted writes are visible.
             return self._rows(batch.query(typeql).resolve())
 
         with self.parent.driver.transaction(self.parent._db_name, TransactionType.READ) as tx:
@@ -298,8 +303,7 @@ class TypeDBCollection(Collection):
             row = {}
             for var in answer.column_names():
                 concept = answer.get(var)
-                # try_get_value() returns None for non-value concepts, so it covers
-                # attributes, reduce results and bare types in one call.
+                # Covers attributes, reduce results and types.
                 value = concept.try_get_value()
                 row[var] = value if value is not None else concept
             rows.append(row)
@@ -309,12 +313,6 @@ class TypeDBCollection(Collection):
 
     def query(self, query: Query, limit: Optional[int] = None, offset: Optional[int] = None, **kwargs) -> QueryResult:
         """Run a query against this collection.
-
-        The query becomes a TypeQL pipeline: a ``match`` for the target class plus the
-        where-clause constraints, then ``fetch`` to read whole objects back. ``fetch
-        { $x.* }`` returns every owned attribute in one round trip, so the attribute
-        list does not have to be enumerated from the schema, and multivalued attributes
-        come back as lists.
 
         A separate ``reduce ... count`` gives the total number of matches, because
         :meth:`Collection.find_iter` pages on ``num_rows`` while ``rows`` holds only the
@@ -336,13 +334,11 @@ class TypeDBCollection(Collection):
         pipeline = [match_block]
         sort_label = self._sort_label(class_name)
         if sort_label:
-            # A stable order is required: find_iter pages by offset, and TypeDB gives no
-            # ordering guarantee without an explicit sort.
+            # Stable order needed for offset paging.
             pipeline.append("sort $sort_key asc;")
         if offset:
             pipeline.append(f"offset {offset};")
-        # Callers signal "no limit" with a negative value (group_by passes -1); TypeQL
-        # expresses that by omitting the clause.
+        # Negative limit means unlimited (group_by passes -1).
         if limit is not None and limit >= 0:
             pipeline.append(f"limit {limit};")
         pipeline.append(self._fetch_block(class_name, query.select_cols))
@@ -383,11 +379,6 @@ class TypeDBCollection(Collection):
     def _constraint_patterns(self, slot_name: str, constraint: Any) -> List[str]:
         """Translate one where-clause entry into TypeQL patterns.
 
-        Supports a bare value (equality) and the operators the duckdb adapter accepts:
-        ``$in``, ``$contains``, ``$ne``, ``$gt``, ``$gte``, ``$lt``, ``$lte``, plus
-        ``$like`` for TypeQL's regex comparator. Several operators on one slot combine
-        conjunctively, as they do in duckdb.
-
         :raises NotImplementedError: for any other operator
         """
         label = self.inserter.attr_names.get(slot_name, typedb_name(slot_name))
@@ -404,16 +395,18 @@ class TypeDBCollection(Collection):
             )
 
         var = f"$v_{label}"
-        patterns = [f"$x has {label} {var};"]
+        patterns = [f"$x has {label} {var};"] if any(op != "$ne" for op in constraint) else []
         for op, value in constraint.items():
-            if op == "$in":
+            if op == "$ne":
+                patterns.append(f"not {{ $x has {label} == {typeql_literal(value, value_type)}; }};")
+            elif op == "$in":
                 options = " or ".join(f"{{ {var} == {typeql_literal(v, value_type)}; }}" for v in value)
                 patterns.append(f"{options};")
             elif op == "$contains":
                 # A multivalued slot is repeated `has`, so membership is equality.
                 patterns.append(f"{var} == {typeql_literal(value, value_type)};")
             elif op == "$like":
-                patterns.append(f"{var} like {typeql_literal(value, 'string')};")
+                patterns.append(f"{var} like {typeql_literal(like_to_regex(str(value)), 'string')};")
             else:
                 patterns.append(f"{var} {COMPARATORS[op]} {typeql_literal(value, value_type)};")
         return patterns
@@ -436,9 +429,7 @@ class TypeDBCollection(Collection):
         """Build the ``fetch`` block: all attributes, plus one subquery per reference slot.
 
         Referenced objects are returned as their identifiers, matching how they are
-        supplied on insert. The *base* relation and role labels are used, which also
-        matches data inserted through a narrowed sub-relation, since the generator
-        declares specialised roles with ``as``.
+        supplied on insert. The *base* relation and role labels are used.
         """
         parts = ['  "_attributes": { $x.* }']
         inserter = self.inserter
@@ -453,8 +444,7 @@ class TypeDBCollection(Collection):
                 id_label = inserter.attr_names.get(target_id_slot, typedb_name(target_id_slot))
                 body = f'fetch {{ "id": $y_{slot.name}.{id_label} }};'
             else:
-                # An inlined object with no identifier: nothing can reference it, so
-                # return its attributes and rebuild the nesting client-side.
+                # No identifier: return attributes inline.
                 body = f"fetch {{ $y_{slot.name}.* }};"
             parts.append(f'  "{slot.name}": [ {subject} {body} ]')
         return "fetch {\n" + ",\n".join(parts) + "\n};"
@@ -468,9 +458,7 @@ class TypeDBCollection(Collection):
     ) -> Dict[str, List[Tuple[Any, int]]]:
         """Return value counts for one or more slots, computed in the database.
 
-        Uses TypeQL's ``reduce ... groupby``, so counting happens server-side rather
-        than by pulling rows back. A multivalued slot contributes one count per value,
-        which matches how duckdb treats an array column.
+        Uses TypeQL's ``reduce ... groupby``.
 
         :param where: optional constraints, in the same form :meth:`query` accepts
         :param facet_columns: slots to facet on; defaults to every scalar slot
@@ -506,9 +494,7 @@ class TypeDBCollection(Collection):
     def _row_to_object(self, row: dict, class_name: str) -> dict:
         """Turn one fetched row into a LinkML-shaped object.
 
-        TypeDB attribute labels are mapped back to LinkML slot names, undoing the
-        renaming the generator applied to reserved words (``type`` becomes
-        ``type_attr`` going in, and back again coming out).
+        TypeDB attribute labels are mapped back to LinkML slot names.
         """
         label_to_slot = {v: k for k, v in self.inserter.attr_names.items()}
         obj: dict = {}
@@ -535,14 +521,8 @@ class TypeDBCollection(Collection):
         """Delete objects matching the given field values.
 
         Each object contributes one ``match``/``delete`` pair and the whole batch runs in
-        a single write transaction. That matters because TypeDB checks ``@card`` lower
-        bounds at commit: removing an entity that plays a mandatory role fails with
-        ``[CNT5]`` unless the relation goes in the same transaction. An object matching
-        nothing deletes nothing, silently, as TypeQL does.
-
-        Where an object carries its identifier, that alone is matched, since it is the
-        class ``@key``. Otherwise every scalar field is matched, as the mongodb adapter
-        does.
+        a single write transaction. Where an object carries its identifier, that alone
+        is matched, since it is the class ``@key``. Otherwise every scalar field is matched.
 
         :param objs: one object or a list of them
         :return: the number of instances actually deleted
@@ -590,9 +570,6 @@ class TypeDBCollection(Collection):
     def _run_deletes(self, queries: List[str]) -> int:
         """Run delete queries in one transaction and count the instances removed.
 
-        A TypeQL delete answers once per matched row, so the answer count is the exact
-        number deleted rather than the number requested.
-
         :param queries: complete ``match``/``delete`` queries
         :return: total instances deleted
         """
@@ -602,7 +579,6 @@ class TypeDBCollection(Collection):
             return 0
         batch = self.parent._active_tx
         if batch is not None:
-            # Inside a batch_write: contribute to it and let the batch commit.
             return sum(len(list(batch.query(q).resolve())) for q in queries)
         with self.parent.driver.transaction(self.parent._db_name, TransactionType.WRITE) as tx:
             deleted = sum(len(list(tx.query(q).resolve())) for q in queries)

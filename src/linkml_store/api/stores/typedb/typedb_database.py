@@ -1,13 +1,4 @@
-"""A linkml-store adapter for TypeDB 3.x.
-
-The TypeDB schema is expected to have been generated from the same LinkML schema by
-``gen-typedb`` (:mod:`linkml.generators.typedbgen`). The adapter does not define the
-schema itself; it addresses the types the generator created, using the shared naming
-rules in :mod:`linkml.generators.typedb.naming` so that both sides agree on labels.
-
-Handles take the form ``typedb://user:password@host:port/database``. User, password
-and port may be omitted, defaulting to ``admin``, ``password`` and ``1729``.
-"""
+"""A linkml-store adapter for TypeDB 3.x, targeting schemas that ``gen-typedb`` generated."""
 
 from __future__ import annotations
 
@@ -21,7 +12,7 @@ from linkml_store.api import Database
 from linkml_store.api.queries import Query, QueryResult
 from linkml_store.api.stores.typedb.typedb_collection import TypeDBCollection
 
-if TYPE_CHECKING:  # pragma: no cover - import cost only paid by type checkers
+if TYPE_CHECKING:  # pragma: no cover
     from typedb.driver import Driver, Transaction
 
 logger = logging.getLogger(__name__)
@@ -35,16 +26,7 @@ DEFAULT_DATABASE = "linkml"
 
 @dataclass(frozen=True)
 class TypeDBHandle:
-    """The parts of a parsed ``typedb://`` handle.
-
-    :ivar address: ``host:port`` for the driver
-    :ivar user: username
-    :ivar password: password
-    :ivar database: the TypeDB database name
-    :ivar tls: whether to connect over TLS
-    :ivar connection_name: the display name Studio shows for this connection, taken
-        from ``?name=``. Informational only; it is not a database name.
-    """
+    """The parts of a parsed ``typedb://`` handle."""
 
     address: str
     user: str
@@ -54,7 +36,7 @@ class TypeDBHandle:
     connection_name: Optional[str] = None
 
     def __repr__(self) -> str:
-        """Redact the password, so a handle cannot leak through logs or tracebacks."""
+        """Redact the password."""
         return (
             f"TypeDBHandle(address={self.address!r}, user={self.user!r}, "
             f"password='***', database={self.database!r}, tls={self.tls!r}, "
@@ -68,7 +50,7 @@ class TypeDBDatabase(Database):
     _driver: Optional["Driver"] = None
     collection_class = TypeDBCollection
 
-    #: the transaction opened by :meth:`batch_write`, if one is open
+    #: the open :meth:`batch_write` transaction
     _active_tx: Optional["Transaction"] = None
 
     def __init__(self, handle: Optional[str] = None, **kwargs):
@@ -79,25 +61,7 @@ class TypeDBDatabase(Database):
         super().__init__(handle=handle, **kwargs)
 
     def _parse_handle(self) -> "TypeDBHandle":
-        """Split the handle into its parts.
-
-        The format is the one TypeDB Studio documents and TypeDB Cloud credentials
-        files contain::
-
-            typedb://<username>:<password>@<address>[/<database>][?name=<connection_name>]
-
-        where ``<address>`` itself carries a scheme, e.g.
-        ``https://x.cluster.typedb.com:80``. Credentials are URL-encoded there, and are
-        decoded here. ``?name=`` is Studio's connection display name, not a database;
-        only the path selects a database, defaulting to :data:`DEFAULT_DATABASE`.
-
-        The authority is split on its last ``@`` and the credentials are decoded after
-        splitting, so a password containing an encoded or literal ``@`` still parses.
-        TLS follows the address scheme when it has one, otherwise defaults to on for
-        remote hosts and off for loopback; ``?tls=true|false`` overrides it.
-
-        :return: the parsed handle
-        """
+        """Parse a Studio-style handle: ``typedb://user:pass@[scheme://]host:port[/db][?name=..&tls=..]``."""
         rest = self.handle
         for prefix in ("typedb://", "typedb+cloud://", "typedb:"):
             if rest.startswith(prefix):
@@ -107,8 +71,7 @@ class TypeDBDatabase(Database):
         rest, _, query_text = rest.partition("?")
         query = parse_qs(query_text)
 
-        # Split on the LAST '@': a password may itself contain '@', ':' or '/',
-        # which urlsplit would mis-parse as part of the authority.
+        # Split on the last '@': passwords may contain '@', ':' or '/'.
         userinfo, sep, hostpath = rest.rpartition("@")
         if not sep:
             userinfo, hostpath = "", rest
@@ -116,9 +79,7 @@ class TypeDBDatabase(Database):
         user = unquote(user) if user else DEFAULT_USER
         password = unquote(password) if password else DEFAULT_PASSWORD
 
-        # TypeDB Cloud hands out an address that is itself an http(s) URL, e.g.
-        # "user:pass@https://x.cluster.typedb.com:80/?name=db". Strip that scheme and
-        # let it decide TLS.
+        # Cloud addresses include an http(s) scheme, which decides TLS.
         scheme_tls = None
         for scheme, enabled in (("https://", True), ("http://", False)):
             if hostpath.startswith(scheme):
@@ -140,8 +101,6 @@ class TypeDBDatabase(Database):
         host = host or "localhost"
         port = int(port_text) if port_text.isdigit() else DEFAULT_PORT
 
-        # "?name=" is Studio's connection display name, NOT a database. Only the path
-        # selects a database.
         connection_name = query.get("name", [""])[0] or None
         db_name = path.strip("/") or DEFAULT_DATABASE
 
@@ -165,14 +124,11 @@ class TypeDBDatabase(Database):
 
     @property
     def driver(self) -> "Driver":
-        """Return the TypeDB driver, connecting on first use.
-
-        :raises ImportError: if the ``typedb`` extra is not installed
-        """
+        """Return the TypeDB driver, connecting on first use."""
         if self._driver is None:
             try:
                 from typedb.driver import Credentials, DriverOptions, DriverTlsConfig, TypeDB
-            except ImportError as e:  # pragma: no cover - exercised only without the extra
+            except ImportError as e:  # pragma: no cover
                 raise ImportError(
                     "The TypeDB adapter requires the typedb-driver package. "
                     "Install it with: pip install 'linkml-store[typedb]'"
@@ -190,11 +146,7 @@ class TypeDBDatabase(Database):
         return self._driver
 
     def transaction(self, transaction_type=None):
-        """Open a transaction on the configured database.
-
-        :param transaction_type: a ``typedb.driver.TransactionType``; defaults to READ
-        :return: the open transaction, usable as a context manager
-        """
+        """Open a transaction (READ by default) on the configured database."""
         from typedb.driver import TransactionType
 
         if transaction_type is None:
@@ -203,27 +155,15 @@ class TypeDBDatabase(Database):
 
     @contextmanager
     def batch_write(self) -> Iterator["Transaction"]:
-        """Run several inserts in one write transaction, committed at the end.
+        """Route every collection write and read through one transaction, committed on exit.
 
-        Loading a graph into TypeDB generally requires this. A relation can only link
-        instances that already exist, and ``@card`` lower bounds are checked at commit,
-        so an entity and its mandatory links have to land together. Where the data is
-        cyclic no per-collection order satisfies both, and the only way through is one
-        transaction spanning every collection::
+        TypeDB checks ``@card`` at commit, so cyclic data has to load in one transaction::
 
             with db.batch_write():
                 for cls in order:
                     db.get_collection(cls).insert(objs[cls], mode=MODE_ENTITIES)
                 for cls in order:
                     db.get_collection(cls).insert(objs[cls], mode=MODE_REFERENCES)
-
-        While the batch is open, :meth:`TypeDBCollection.insert` writes into it and does
-        not commit, and reads are served from the same transaction so they see what the
-        batch has written but not yet committed. The transaction commits when the block
-        exits normally, and is closed without committing if the block raises.
-
-        :return: the open write transaction, if a caller wants it directly
-        :raises RuntimeError: if a batch is already open on this database
         """
         from typedb.driver import TransactionType
 
@@ -242,7 +182,7 @@ class TypeDBDatabase(Database):
             self._active_tx = None
 
     def commit(self, **kwargs):
-        """No-op: each write runs in its own transaction and commits there."""
+        """No-op: each write commits its own transaction."""
 
     def close(self, **kwargs):
         """Close the driver connection, if one was opened."""
@@ -251,10 +191,7 @@ class TypeDBDatabase(Database):
             self._driver = None
 
     def drop(self, missing_ok=True, **kwargs):
-        """Delete the TypeDB database named in the handle.
-
-        :param missing_ok: if False, raise when the database does not exist
-        """
+        """Delete the TypeDB database named in the handle."""
         databases = self.driver.databases
         if databases.contains(self._db_name):
             databases.get(self._db_name).delete()
@@ -262,21 +199,13 @@ class TypeDBDatabase(Database):
             raise ValueError(f"No such TypeDB database: {self._db_name}")
 
     def query(self, query: Query, **kwargs) -> QueryResult:
-        """Delegate a query to the collection named by ``from_table``.
-
-        :raises NotImplementedError: if the query names no collection
-        """
+        """Delegate a query to the collection named by ``from_table``."""
         if query.from_table:
             return self.get_collection(query.from_table).query(query, **kwargs)
         raise NotImplementedError(f"Querying without a table is not supported in {type(self).__name__}")
 
     def init_collections(self):
-        """Create one collection per class in the LinkML schema.
-
-        TypeDB has no collection concept; entity types stand in for them. The LinkML
-        schema is the source of truth here, since it also records which classes are
-        relations rather than entities.
-        """
+        """Create one collection per class in the LinkML schema."""
         if self._collections is None:
             self._collections = {}
         for class_name in self.schema_view.all_classes():

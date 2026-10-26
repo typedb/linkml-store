@@ -1,22 +1,8 @@
 # ---------------------------------------------------------------------------
 # VENDORED FILE - DO NOT EDIT BY HAND
 #
-# Verbatim copy of linkml.generators.typedb.naming.
-#
-# The adapter must choose exactly the labels gen-typedb wrote into the schema it
-# loads into, so these rules cannot be reimplemented here. They are vendored rather
-# than imported because the module is not in any linkml release yet, and uv sources
-# do not survive into published wheel metadata.
-#
-# To update:   just sync-typedb-naming
-# To verify:   python scripts/sync_typedb_naming.py --check
-#
-# Everything below the marker is byte-identical to upstream, enforced by
-# tests/test_api/test_typedb_adapter.py::test_vendored_naming_matches_upstream
-# whenever linkml is installed.
-#
-# When a linkml release includes the module, delete this file and import
-# linkml.generators.typedb.naming directly.
+# Verbatim copy of linkml.generators.typedb.naming, which no linkml release ships yet.
+# Update with `just sync-typedb-naming`; delete once a release includes the module.
 # ---------------------------------------------------------------------------
 # >>> BEGIN VENDORED CONTENT >>>
 """Shared LinkML-to-TypeDB naming rules.

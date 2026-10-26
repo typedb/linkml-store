@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10, <4.0"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -3276,8 +3276,8 @@ requires-dist = [
     { name = "tabulate" },
     { name = "tiktoken", marker = "extra == 'all'" },
     { name = "tiktoken", marker = "extra == 'llm'" },
-    { name = "typedb-driver", marker = "extra == 'all'", specifier = ">=3.0.0" },
-    { name = "typedb-driver", marker = "extra == 'typedb'", specifier = ">=3.0.0" },
+    { name = "typedb-driver", marker = "extra == 'all'", specifier = ">=3.13.0" },
+    { name = "typedb-driver", marker = "extra == 'typedb'", specifier = ">=3.13.0" },
     { name = "ucumvert", marker = "extra == 'map'", specifier = ">=0.2.0" },
     { name = "uvicorn", marker = "extra == 'fastapi'" },
     { name = "xmltodict", specifier = ">=0.13.0" },
